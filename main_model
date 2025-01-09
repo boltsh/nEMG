@@ -1,0 +1,194 @@
+import torch
+import torch.nn as nn
+import itertools as it
+import os
+import torch.optim as optim
+import torchaudio
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import tools as T
+import tools.torch
+import matplotlib.pyplot as plt
+
+# Set device (GPU if available, otherwise CPU)
+device = torch.device("cuda:2")
+
+
+# 1. Dataset class definition
+class AnimalSoundDataset(Dataset):
+    def __init__(self, data_dir, label_encoder, target_length=22050, transform=None):
+        self.data_dir = data_dir
+        self.target_length = target_length
+        self.transform = transform
+        self.label_encoder = label_encoder
+        self.class_labels = []
+        self.audio_files = []
+        self.labels = []
+
+        self._load_data()
+
+    def _load_data(self):
+        for class_name in os.listdir(self.data_dir):
+            class_path = os.path.join(self.data_dir, class_name)
+            if os.path.isdir(class_path):
+                self.class_labels.append(class_name)
+                for file_name in os.listdir(class_path):
+                    if file_name.endswith('.wav'):
+                        file_path = os.path.join(class_path, file_name)
+                        self.audio_files.append(file_path)
+                        self.labels.append(class_name)
+
+    def __len__(self):
+        return len(self.audio_files)
+
+    def __getitem__(self, idx):
+        file_path = self.audio_files[idx]
+        label = self.labels[idx]
+
+        waveform, sample_rate = torchaudio.load(file_path)
+
+        if waveform.size(0) == 2:
+            waveform = waveform[0:1, :]
+
+        if waveform.size(1) < self.target_length:
+            padding = self.target_length - waveform.size(1)
+            waveform = torch.cat([waveform, torch.zeros(1, padding)], dim=1)
+        elif waveform.size(1) > self.target_length:
+            waveform = waveform[:, :self.target_length]
+
+        if self.transform:
+            waveform = self.transform(waveform)
+
+        label_tensor = torch.tensor(self.label_encoder.transform([label])[0])
+
+        return waveform, label_tensor
+
+#######################################################################################################################
+# 2. Model definition
+class ConvBlock(nn.Module):
+    def __init__(self, in_channel=1, out_channel=64, kernel_size=3, stride=1):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv1d(in_channel, out_channel, kernel_size=kernel_size, stride=stride, padding=kernel_size // 2),
+            nn.BatchNorm1d(out_channel),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channel, kernel_size=5):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv1d(in_channel, in_channel, kernel_size=kernel_size, stride=1, padding='same'),
+            nn.BatchNorm1d(in_channel),
+            nn.ReLU(),
+            nn.Conv1d(in_channel, in_channel, kernel_size=kernel_size, stride=1, padding='same'),
+            nn.BatchNorm1d(in_channel)
+        )
+
+    def forward(self, x):
+        return self.layers(x) + x  # Residual connection
+
+
+class nEMGNet(nn.Module):
+    def __init__(self, num_classes, n_channel_list=[64, 128, 256, 512], n_repeat=2):
+        super().__init__()
+        layers = []
+        in_channels = 1
+        for out_channels in n_channel_list:
+            layers.append(ConvBlock(in_channel=in_channels, out_channel=out_channels))
+            layers.append(nn.Sequential(*[ResBlock(out_channels) for _ in range(n_repeat)]))
+            in_channels = out_channels
+
+        self.cnn = nn.Sequential(*layers)
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(n_channel_list[-1] * (22050 // 2**len(n_channel_list)), 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.cnn(x)
+        x = self.fc(x)
+        return x
+
+#######################################################################################################################
+
+# 3. Data loading
+data_dir = "/home/*******/goup5/DATA/Animal-Soundprepros"
+
+label_encoder = LabelEncoder()
+dataset = AnimalSoundDataset(data_dir, label_encoder)
+label_encoder.fit(dataset.labels)
+
+X_train, X_test, y_train, y_test = train_test_split(dataset.audio_files, dataset.labels, test_size=0.2, random_state=42)
+
+train_dataset = AnimalSoundDataset(data_dir, label_encoder=label_encoder, target_length=22050)
+test_dataset = AnimalSoundDataset(data_dir, label_encoder=label_encoder, target_length=22050)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# 4. Model training with loss tracking
+losses = []  # List to store the loss for each epoch
+
+num_classes = len(label_encoder.classes_)
+model = nEMGNet(num_classes=num_classes).to(device)  # Move the model to the selected device (GPU/CPU)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.00005)
+
+
+epochs = 100
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)  # Move data to device
+
+        inputs = inputs.view(inputs.size(0), 1, -1)
+
+        optimizer.zero_grad()
+        outputs = model(inputs.float())
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / len(train_loader)
+    losses.append(epoch_loss)  # Append the loss for this epoch
+    print(f"Epoch {epoch + 1}, Loss: {epoch_loss}")
+
+# 5. Plot the loss for each epoch after the training loop
+plt.plot(range(1, epochs + 1), losses, marker='o', linestyle='-', color='b')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss per Epoch')
+plt.grid(True)
+plt.show()
+
+# 6. Model evaluation
+model.eval()
+correct = 0
+total = 0
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)  # Move data to device
+
+        inputs = inputs.view(inputs.size(0), 1, -1)
+        outputs = model(inputs.float())
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+print(f"Test accuracy: {100 * correct / total:.2f}%")
+
+# 7. Save the model
+torch.save(model.state_dict(), "/home/********/goup5/DATA/sound_model_FeedBack.pth")
