@@ -1,0 +1,142 @@
+import os
+import torch
+import torchaudio
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+
+# Set device (GPU if available, otherwise CPU)
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+
+# Model definition
+class ConvBlock(nn.Module):
+    def __init__(self, in_channel=1, out_channel=64, kernel_size=3, stride=1):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv1d(in_channel, out_channel, kernel_size=kernel_size, stride=stride, padding=kernel_size // 2),
+            nn.BatchNorm1d(out_channel),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channel, kernel_size=5):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv1d(in_channel, in_channel, kernel_size=kernel_size, stride=1, padding='same'),
+            nn.BatchNorm1d(in_channel),
+            nn.ReLU(),
+            nn.Conv1d(in_channel, in_channel, kernel_size=kernel_size, stride=1, padding='same'),
+            nn.BatchNorm1d(in_channel)
+        )
+
+    def forward(self, x):
+        return self.layers(x) + x  # Residual connection
+
+class nEMGNet(nn.Module):
+    def __init__(self, num_classes, n_channel_list=[64, 128, 256, 512], n_repeat=2):
+        super().__init__()
+        layers = []
+        in_channels = 1
+        for out_channels in n_channel_list:
+            layers.append(ConvBlock(in_channel=in_channels, out_channel=out_channels))
+            layers.append(nn.Sequential(*[ResBlock(out_channels) for _ in range(n_repeat)]))
+            in_channels = out_channels
+
+        self.cnn = nn.Sequential(*layers)
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(n_channel_list[-1] * (22050 // 2**len(n_channel_list)), 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.cnn(x)
+        x = self.fc(x)
+        return x
+
+# Test 데이터 경로
+test_dir = "/home/*******/goup5/DATA/test"
+
+# 클래스 정의 (train.py에서 사용된 클래스와 동일해야 함)
+classes = ['Cat', 'Chicken', 'Cow', 'Dog', 'Frog', 'Horse', 'Monkey', 'Sheep']
+label_encoder = LabelEncoder()
+label_encoder.fit(classes)
+
+# 모델 초기화 및 로드
+model_path = "/home/dg1siec-1/goup5/DATA/sound_model_FeedBack.pth"
+num_classes = len(classes)
+model = nEMGNet(num_classes=num_classes).to(device)
+model.load_state_dict(torch.load(model_path, map_location=device))
+model.eval()
+
+# 데이터 전처리 함수
+def preprocess_audio(file_path, target_length=22050):
+    waveform, sample_rate = torchaudio.load(file_path)
+    if waveform.size(0) == 2:
+        waveform = waveform[0:1, :]
+    if waveform.size(1) < target_length:
+        padding = target_length - waveform.size(1)
+        waveform = torch.cat([waveform, torch.zeros(1, padding)], dim=1)
+    elif waveform.size(1) > target_length:
+        waveform = waveform[:, :target_length]
+    return waveform
+
+# 테스트 데이터 불러오기
+def load_test_data(test_dir):
+    audio_files = []
+    labels = []
+    for class_name in os.listdir(test_dir):
+        class_path = os.path.join(test_dir, class_name)
+        if os.path.isdir(class_path):
+            for file_name in os.listdir(class_path):
+                if file_name.endswith(".wav"):
+                    file_path = os.path.join(class_path, file_name)
+                    audio_files.append(file_path)
+                    labels.append(class_name)
+    return audio_files, labels
+
+# Test 데이터 로드
+audio_files, true_labels = load_test_data(test_dir)
+true_labels_encoded = label_encoder.transform(true_labels)
+
+# 예측 수행
+predicted_labels_encoded = []
+for file_path in audio_files:
+    waveform = preprocess_audio(file_path).to(device)
+    waveform = waveform.unsqueeze(0).float()  # (1, 1, target_length)
+    with torch.no_grad():
+        outputs = model(waveform)
+        _, predicted = torch.max(outputs, 1)
+        predicted_labels_encoded.append(predicted.item())
+
+# 결과 계산
+predicted_labels = label_encoder.inverse_transform(predicted_labels_encoded)
+cm = confusion_matrix(true_labels, predicted_labels, labels=classes)
+accuracy = accuracy_score(true_labels, predicted_labels)
+
+# TP, FP, TN, FN 계산 및 출력
+print("Confusion Matrix:")
+print(cm)
+
+print("\nAccuracy:", accuracy)
+
+print("\nClassification Report:")
+print(classification_report(true_labels, predicted_labels, target_names=classes))
+
+# TP, FP, TN, FN 계산
+for idx, class_name in enumerate(classes):
+    TP = cm[idx, idx]
+    FP = cm[:, idx].sum() - TP
+    FN = cm[idx, :].sum() - TP
+    TN = cm.sum() - (TP + FP + FN)
+
+    print(f"\nClass: {class_name}  TP: {TP}, FP: {FP}, FN: {FN}, TN: {TN}")
